@@ -16,7 +16,8 @@ import torch.nn as nn
 from scipy.stats import wilcoxon
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.datautils import load_attributes, rescale_features
+import src.datautils as datautils_module
+from src.datautils import load_attributes
 from src.datasets import CamelsTXT
 from src.lstm import LSTM
 from src.metrics import calc_fdc_fhv, calc_fdc_flv, calc_nse
@@ -160,6 +161,34 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+def load_dynamic_output_scaler(path: Path) -> dict[str, Any]:
+    scaler = load_json(path)
+    required = ["input_means", "input_stds", "output_mean", "output_std"]
+    missing = [key for key in required if key not in scaler]
+    if missing:
+        raise RuntimeError(f"{path} is missing scaler fields: {missing}")
+    input_means = np.asarray(scaler["input_means"], dtype=np.float64)
+    input_stds = np.asarray(scaler["input_stds"], dtype=np.float64)
+    output_mean = float(scaler["output_mean"])
+    output_std = float(scaler["output_std"])
+    if input_means.shape != (DYN_INPUT_SIZE,) or input_stds.shape != (DYN_INPUT_SIZE,):
+        raise RuntimeError(f"{path} has invalid dynamic-input scaler shape")
+    if np.any(~np.isfinite(input_means)) or np.any(~np.isfinite(input_stds)) or np.any(input_stds <= 0.0):
+        raise RuntimeError(f"{path} has invalid dynamic-input scaler values")
+    if not np.isfinite(output_mean) or not np.isfinite(output_std) or output_std <= 0.0:
+        raise RuntimeError(f"{path} has invalid output scaler values")
+    return scaler
+
+
+def install_scaler(scaler: dict[str, Any]) -> None:
+    datautils_module.SCALER = {
+        "input_means": np.asarray(scaler["input_means"], dtype=np.float64),
+        "input_stds": np.asarray(scaler["input_stds"], dtype=np.float64),
+        "output_mean": np.asarray([scaler["output_mean"]], dtype=np.float64),
+        "output_std": np.asarray([scaler["output_std"]], dtype=np.float64),
+    }
+
+
 def load_static_norm(path: Path) -> tuple[pd.Series, pd.Series, list[str]]:
     cfg = load_json(path)
     columns = list(cfg["columns"])
@@ -214,21 +243,23 @@ def resolve_artifacts(
     pt_root: Path,
     meta_root: Path,
     mst_root: Path,
-) -> tuple[Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path]:
     if model_name == "global":
         model_dir = global_root / f"seed{seed}" / f"fold_{fold}"
         model_path = model_dir / "model_best.pt"
         cfg_path = model_dir / "run_cfg.json"
         norm_path = model_dir / "static_norm.json"
-        db_path = global_root / "_shared_fold_data" / f"fold_{fold}" / "attributes_filtered.db"
+        db_path = global_root / "shared_data" / f"fold_{fold}" / "attributes_filtered.db"
+        scaler_path = model_dir / "dynamic_output_scaler.json"
     elif model_name == "cluster":
         if cluster_id is None:
             raise ValueError("cluster_id is required")
         model_dir = cluster_root / f"seed{seed}" / f"fold_{fold}" / "cluster_models" / f"cluster_{cluster_id}"
         model_path = model_dir / "model_best.pt"
         cfg_path = model_dir / "run_cfg.json"
-        norm_path = model_dir / "static_norm_train_only.json"
-        db_path = cluster_root / "_shared_fold_data" / f"fold_{fold}" / "attributes_filtered.db"
+        norm_path = model_dir / "static_norm.json"
+        db_path = cluster_root / "shared_data" / f"fold_{fold}" / "attributes_filtered.db"
+        scaler_path = model_dir / "dynamic_output_scaler.json"
     elif model_name == "pretrain_finetune":
         if cluster_id is None:
             raise ValueError("cluster_id is required")
@@ -236,7 +267,8 @@ def resolve_artifacts(
         model_path = model_dir / "model_best.pt"
         cfg_path = model_dir / "run_cfg.json"
         norm_path = global_root / f"seed{seed}" / f"fold_{fold}" / "static_norm.json"
-        db_path = global_root / "_shared_fold_data" / f"fold_{fold}" / "attributes_filtered.db"
+        db_path = global_root / "shared_data" / f"fold_{fold}" / "attributes_filtered.db"
+        scaler_path = model_dir / "dynamic_output_scaler.json"
     elif model_name == "meta_finetune":
         if cluster_id is None:
             raise ValueError("cluster_id is required")
@@ -244,14 +276,14 @@ def resolve_artifacts(
         model_path = model_dir / "model_best.pt"
         cfg_path = model_dir / "run_cfg.json"
         norm_path = meta_root / f"seed{seed}" / f"fold_{fold}" / "static_norm.json"
-        db_path = meta_root / "_shared_fold_data" / f"fold_{fold}" / "attributes_filtered.db"
+        db_path = meta_root / "shared_data" / f"fold_{fold}" / "attributes_filtered.db"
+        scaler_path = model_dir / "dynamic_output_scaler.json"
     else:
         raise ValueError(model_name)
-    for path in [model_path, cfg_path, norm_path, db_path]:
+    for path in [model_path, cfg_path, norm_path, db_path, scaler_path]:
         if not path.exists():
             raise FileNotFoundError(path)
-    return model_path, cfg_path, norm_path, db_path
-
+    return model_path, cfg_path, norm_path, db_path, scaler_path
 
 def load_static_vector(db_path: Path, basin: str, columns: list[str], means: pd.Series, stds: pd.Series) -> torch.Tensor:
     df = load_attributes(str(db_path), [basin], drop_lat_lon=True)
@@ -312,10 +344,13 @@ def predict_basin(
     cfg_path: Path,
     norm_path: Path,
     db_path: Path,
+    scaler_path: Path,
     batch_size: int,
     num_workers: int,
     clip_negative: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    scaler = load_dynamic_output_scaler(scaler_path)
+    install_scaler(scaler)
     cfg = load_json(cfg_path)
     hidden_size = int(cfg["hidden_size"])
     dropout = float(cfg.get("dropout", 0.4))
@@ -343,7 +378,7 @@ def predict_basin(
             preds.append(pred)
             obs.append(y.numpy())
     pred_norm = np.concatenate(preds, axis=0).reshape(-1, 1)
-    sim = rescale_features(pred_norm, variable="output").reshape(-1)
+    sim = datautils_module.rescale_features(pred_norm, variable="output").reshape(-1)
     obs_arr = np.concatenate(obs, axis=0).reshape(-1)
     if clip_negative:
         sim = np.maximum(sim, 0.0)
@@ -421,7 +456,7 @@ def evaluate_one_model(
             for i, basin in enumerate(ungauged, 1):
                 cluster_id = None if mapping is None else int(mapping[basin])
                 try:
-                    model_path, cfg_path, norm_path, db_path = resolve_artifacts(
+                    model_path, cfg_path, norm_path, db_path, scaler_path = resolve_artifacts(
                         model_name,
                         seed,
                         fold,
@@ -439,6 +474,7 @@ def evaluate_one_model(
                         cfg_path,
                         norm_path,
                         db_path,
+                        scaler_path,
                         batch_size,
                         num_workers,
                         clip_negative,
