@@ -4,6 +4,7 @@ import argparse
 import json
 import random
 import re
+import shutil
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
-from src.datautils import INVALID_ATTR, add_camels_attributes, load_attributes
+import src.datautils as datautils_module
+from src.datautils import INVALID_ATTR, add_camels_attributes, load_attributes, load_discharge, load_forcing
 from src.datasets import CamelsH5
 from src.lstm import LSTM
 from src.nseloss import NSELoss
@@ -48,6 +50,8 @@ GRAD_CLIP = 1.0
 FORGET_GATE_BIAS = 5
 DYN_INPUT_SIZE = 5
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+DYNAMIC_COLUMNS = ["PRCP(mm/day)", "SRAD(W/m2)", "Tmax(C)", "Tmin(C)", "Vp(Pa)"]
+SCALER_PROTOCOL = "fold_training_period"
 
 
 def normalize_basin_id(value: Any) -> str:
@@ -74,6 +78,85 @@ def read_basin_list(path: Path) -> list[str]:
 def save_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def compute_fold_dynamic_output_scaler(camels_root: Path, basins: list[str]) -> dict[str, Any]:
+    x_count = np.zeros(DYN_INPUT_SIZE, dtype=np.int64)
+    x_sum = np.zeros(DYN_INPUT_SIZE, dtype=np.float64)
+    x_sumsq = np.zeros(DYN_INPUT_SIZE, dtype=np.float64)
+    y_count = 0
+    y_sum = 0.0
+    y_sumsq = 0.0
+    start = pd.Timestamp(TRAIN_START)
+    end = pd.Timestamp(TRAIN_END)
+    for i, basin in enumerate(basins, 1):
+        forcing, area = load_forcing(camels_root, basin)
+        forcing = forcing.loc[start:end]
+        x = forcing[DYNAMIC_COLUMNS].to_numpy(dtype=np.float64)
+        finite_x = np.isfinite(x)
+        x_count += finite_x.sum(axis=0).astype(np.int64)
+        x_safe = np.where(finite_x, x, 0.0)
+        x_sum += x_safe.sum(axis=0)
+        x_sumsq += np.square(x_safe).sum(axis=0)
+        q = load_discharge(camels_root, basin, area).loc[start:end].to_numpy(dtype=np.float64)
+        valid_y = np.isfinite(q) & (q >= 0.0)
+        q = q[valid_y]
+        y_count += int(q.size)
+        y_sum += float(q.sum())
+        y_sumsq += float(np.square(q).sum())
+        if i == 1 or i % 25 == 0 or i == len(basins):
+            print(f"[scaler] {i}/{len(basins)}")
+    if np.any(x_count == 0) or y_count == 0:
+        raise RuntimeError("Unable to compute fold scaler")
+    input_means = x_sum / x_count
+    input_vars = x_sumsq / x_count - np.square(input_means)
+    input_stds = np.sqrt(np.maximum(input_vars, 0.0))
+    output_mean = y_sum / y_count
+    output_var = y_sumsq / y_count - output_mean ** 2
+    output_std = float(np.sqrt(max(output_var, 0.0)))
+    if np.any(~np.isfinite(input_means)) or np.any(~np.isfinite(input_stds)) or np.any(input_stds <= 0.0):
+        raise RuntimeError("Invalid dynamic-input scaler")
+    if not np.isfinite(output_mean) or not np.isfinite(output_std) or output_std <= 0.0:
+        raise RuntimeError("Invalid output scaler")
+    return {
+        "protocol": SCALER_PROTOCOL,
+        "train_start": TRAIN_START,
+        "train_end": TRAIN_END,
+        "dynamic_columns": DYNAMIC_COLUMNS,
+        "input_means": [float(x) for x in input_means],
+        "input_stds": [float(x) for x in input_stds],
+        "output_mean": float(output_mean),
+        "output_std": float(output_std),
+        "input_counts": [int(x) for x in x_count],
+        "output_count": int(y_count),
+        "n_train_basins": len(basins),
+        "train_basins": basins,
+    }
+
+
+def install_scaler(scaler: dict[str, Any]) -> None:
+    datautils_module.SCALER = {
+        "input_means": np.asarray(scaler["input_means"], dtype=np.float64),
+        "input_stds": np.asarray(scaler["input_stds"], dtype=np.float64),
+        "output_mean": np.asarray([scaler["output_mean"]], dtype=np.float64),
+        "output_std": np.asarray([scaler["output_std"]], dtype=np.float64),
+    }
+
+
+def validate_scaler(scaler: dict[str, Any], gauged_basins: list[str]) -> None:
+    if scaler.get("protocol") != SCALER_PROTOCOL:
+        raise RuntimeError("Existing scaler protocol does not match current setting")
+    if scaler.get("train_start") != TRAIN_START or scaler.get("train_end") != TRAIN_END:
+        raise RuntimeError("Existing scaler period does not match current setting")
+    if scaler.get("dynamic_columns") != DYNAMIC_COLUMNS:
+        raise RuntimeError("Existing scaler dynamic columns do not match current setting")
+    saved_basins = list(scaler.get("train_basins", []))
+    if saved_basins and set(saved_basins) != set(gauged_basins):
+        raise RuntimeError("Existing scaler basin set does not match current fold gauged basins")
 
 
 def set_seed(seed: int) -> None:
@@ -212,14 +295,15 @@ def load_cluster_members(cluster_root: Path, seed: int, fold: int, gauged: list[
     return members
 
 
-def prepare_fold_data(camels_root: Path, output_root: Path, fold: int, gauged: list[str], force: bool) -> tuple[Path, Path]:
-    data_dir = output_root / "_shared_fold_data" / f"fold_{fold}"
+def prepare_fold_data(camels_root: Path, output_root: Path, fold: int, gauged: list[str], force: bool) -> tuple[Path, Path, Path, dict[str, Any]]:
+    data_dir = output_root / "shared_data" / f"fold_{fold}"
     data_dir.mkdir(parents=True, exist_ok=True)
     raw_db = data_dir / "attributes.db"
     filtered_db = data_dir / "attributes_filtered.db"
-    h5_path = data_dir / "train_h5_all_gauged_19891001_19990930.h5"
+    scaler_path = data_dir / "dynamic_output_scaler.json"
+    h5_path = data_dir / "train.h5"
     if force:
-        for path in [raw_db, filtered_db, h5_path]:
+        for path in [raw_db, filtered_db, scaler_path, h5_path]:
             if path.exists():
                 path.unlink()
     if not raw_db.exists():
@@ -235,6 +319,13 @@ def prepare_fold_data(camels_root: Path, output_root: Path, fold: int, gauged: l
         attrs = attrs[latlon + rest]
         with sqlite3.connect(str(filtered_db)) as conn:
             attrs.to_sql("basin_attributes", conn, if_exists="replace", index_label="gauge_id")
+    if scaler_path.exists():
+        scaler = load_json(scaler_path)
+        validate_scaler(scaler, gauged)
+    else:
+        scaler = compute_fold_dynamic_output_scaler(camels_root, gauged)
+        save_json(scaler_path, scaler)
+    install_scaler(scaler)
     if not h5_path.exists():
         create_h5_files(
             camels_root=camels_root,
@@ -244,7 +335,7 @@ def prepare_fold_data(camels_root: Path, output_root: Path, fold: int, gauged: l
             with_basin_str=True,
             seq_length=SEQ_LENGTH,
         )
-    return filtered_db, h5_path
+    return filtered_db, h5_path, scaler_path, scaler
 
 
 class ClusterLSTMModel(nn.Module):
@@ -306,6 +397,8 @@ def train_one_cluster(
     fold_gauged: list[str],
     h5_path: Path,
     filtered_db: Path,
+    scaler_path: Path,
+    scaler: dict[str, Any],
     output_root: Path,
     h5_basin_strings: np.ndarray,
     hidden_rule: str,
@@ -341,8 +434,9 @@ def train_one_cluster(
     base_ds.attribute_means = means
     base_ds.attribute_stds = stds
     base_ds.attribute_names = base_ds.df.columns
+    shutil.copy2(scaler_path, out_dir / "dynamic_output_scaler.json")
     save_json(
-        out_dir / "static_norm_train_only.json",
+        out_dir / "static_norm.json",
         {
             "columns": list(base_ds.df.columns),
             "means": {k: float(v) for k, v in means.to_dict().items()},
@@ -417,7 +511,13 @@ def train_one_cluster(
             "early_stopping": True,
             "model_selection": "lowest_train_loss_model_best",
             "validation": "disabled",
-            "static_scaler_scope": "current_fold_current_cluster_gauged_only",
+            "static_scaler_scope": "fold_cluster",
+            "dynamic_output_scaler_scope": SCALER_PROTOCOL,
+            "dynamic_output_scaler": str(out_dir / "dynamic_output_scaler.json"),
+            "dynamic_input_means": scaler["input_means"],
+            "dynamic_input_stds": scaler["input_stds"],
+            "output_mean": scaler["output_mean"],
+            "output_std": scaler["output_std"],
         },
     )
     stop_reason = "max_epochs"
@@ -550,6 +650,7 @@ def train_one_cluster(
             "cluster_id": cid,
             "n_train_basins": len(member_basins),
             "hidden_size": hidden_size,
+            "dynamic_output_scaler_scope": SCALER_PROTOCOL,
         },
     )
     print(f"[done] seed={seed} fold={fold} cluster={cid} best={best_score:.6f}@{best_epoch}")
@@ -602,7 +703,7 @@ def main() -> None:
         for fold in range(1, N_FOLDS + 1):
             gauged, ungauged = folds[fold]
             cluster_members = load_cluster_members(cluster_root, seed, fold, gauged)
-            filtered_db, h5_path = shared_data[fold]
+            filtered_db, h5_path, scaler_path, scaler = shared_data[fold]
             with h5py.File(str(h5_path), "r") as file:
                 h5_basin_strings = np.char.decode(file["sample_2_basin"][:], "ascii")
             save_json(
@@ -616,6 +717,8 @@ def main() -> None:
                     "train_period": [TRAIN_START, TRAIN_END],
                     "test_period": [TEST_START, TEST_END],
                     "n_clusters": N_CLUSTERS,
+                    "dynamic_output_scaler_scope": SCALER_PROTOCOL,
+                    "dynamic_output_scaler": str(scaler_path),
                 },
             )
             for cid in range(N_CLUSTERS):
@@ -627,6 +730,8 @@ def main() -> None:
                     fold_gauged=gauged,
                     h5_path=h5_path,
                     filtered_db=filtered_db,
+                    scaler_path=scaler_path,
+                    scaler=scaler,
                     output_root=output_root,
                     h5_basin_strings=h5_basin_strings,
                     hidden_rule=args.hidden_rule,

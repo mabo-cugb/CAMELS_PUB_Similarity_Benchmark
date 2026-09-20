@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -187,10 +188,11 @@ def load_state(path: Path) -> dict[str, torch.Tensor]:
     return obj
 
 
-def resolve_init_artifacts(init_type: str, init_root: Path, seed: int, fold: int) -> tuple[Path, Path, Path, Path]:
-    shared_dir = init_root / "_shared_fold_data" / f"fold_{fold}"
+def resolve_init_artifacts(init_type: str, init_root: Path, seed: int, fold: int) -> tuple[Path, Path, Path, Path, Path]:
+    shared_dir = init_root / "shared_data" / f"fold_{fold}"
     filtered_db = shared_dir / "attributes_filtered.db"
     h5_path = shared_dir / "train.h5"
+    scaler_path = shared_dir / "dynamic_output_scaler.json"
     fold_dir = init_root / f"seed{seed}" / f"fold_{fold}"
     if init_type == "global":
         model_path = fold_dir / "model_best.pt"
@@ -198,10 +200,10 @@ def resolve_init_artifacts(init_type: str, init_root: Path, seed: int, fold: int
     else:
         model_path = fold_dir / "meta_pretrained_best.pt"
         norm_path = fold_dir / "static_norm.json"
-    for path in [filtered_db, h5_path, model_path, norm_path]:
+    for path in [filtered_db, h5_path, scaler_path, model_path, norm_path]:
         if not path.exists():
             raise FileNotFoundError(path)
-    return model_path, filtered_db, h5_path, norm_path
+    return model_path, filtered_db, h5_path, norm_path, scaler_path
 
 
 def load_static_norm(path: Path) -> tuple[pd.Series, pd.Series, list[str]]:
@@ -214,9 +216,10 @@ def load_static_norm(path: Path) -> tuple[pd.Series, pd.Series, list[str]]:
     return means, stds, columns
 
 
-def train_one_cluster(init_type: str, seed: int, fold: int, cid: int, member_basins: list[str], gauged: list[str], model_path: Path, filtered_db: Path, h5_path: Path, norm_path: Path, output_root: Path, num_workers: int) -> None:
+def train_one_cluster(init_type: str, seed: int, fold: int, cid: int, member_basins: list[str], gauged: list[str], model_path: Path, filtered_db: Path, h5_path: Path, norm_path: Path, scaler_path: Path, output_root: Path, num_workers: int) -> None:
     out_dir = output_root / f"seed{seed}" / f"fold_{fold}" / f"cluster_{cid}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(scaler_path, out_dir / "dynamic_output_scaler.json")
     done_path = out_dir / "TRAIN_DONE.json"
     if done_path.exists():
         print(f"[skip] {init_type} seed={seed} fold={fold} cluster={cid} completed")
@@ -297,6 +300,7 @@ def train_one_cluster(init_type: str, seed: int, fold: int, cid: int, member_bas
             "max_lr_decays": MAX_LR_DECAYS,
             "grad_clip": GRAD_CLIP,
             "static_norm_scope": "all_gauged_current_fold",
+            "dynamic_output_scaler": str(out_dir / "dynamic_output_scaler.json"),
             "full_parameter_finetune": True,
         },
     )
@@ -424,9 +428,9 @@ def main() -> None:
         for fold in args.folds:
             gauged, _ = folds[fold]
             members = load_cluster_members(args.cluster_root, seed, fold, gauged)
-            model_path, filtered_db, h5_path, norm_path = resolve_init_artifacts(args.init_type, args.init_root, seed, fold)
+            model_path, filtered_db, h5_path, norm_path, scaler_path = resolve_init_artifacts(args.init_type, args.init_root, seed, fold)
             for cid in range(N_CLUSTERS):
-                train_one_cluster(args.init_type, seed, fold, cid, members[cid], gauged, model_path, filtered_db, h5_path, norm_path, args.output_root, args.num_workers)
+                train_one_cluster(args.init_type, seed, fold, cid, members[cid], gauged, model_path, filtered_db, h5_path, norm_path, scaler_path, args.output_root, args.num_workers)
 
 
 if __name__ == "__main__":
