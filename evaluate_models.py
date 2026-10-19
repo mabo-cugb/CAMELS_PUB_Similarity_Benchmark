@@ -38,13 +38,13 @@ TEST_END = "2004-09-30"
 SEQ_LENGTH = 270
 DYN_INPUT_SIZE = 5
 FORGET_GATE_BIAS = 5
-SEEDS = [12345, 1234, 123]
+SEEDS = [12345, 1234, 123,12,1]
 N_FOLDS = 5
 MODEL_ORDER = ["global", "cluster", "pretrain_finetune", "meta_finetune"]
 MODEL_LABELS = {
     "global": "G",
     "cluster": "ST",
-    "pretrain_finetune": "PT-ST",
+    "pretrain_finetune": "PTST",
     "meta_finetune": "MST",
 }
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -79,19 +79,33 @@ def resolve_split_dir(split_root: Path, fold: int) -> Path:
     raise FileNotFoundError(f"Missing fold_{fold} split under {split_root}")
 
 
-def load_splits(split_root: Path) -> dict[int, tuple[list[str], list[str]]]:
+def load_splits(split_root: Path, selected_folds: list[int] | None = None) -> dict[int, tuple[list[str], list[str]]]:
+    if selected_folds is None:
+        selected_folds = list(range(1, N_FOLDS + 1))
+    if not selected_folds or len(set(selected_folds)) != len(selected_folds):
+        raise ValueError("--folds must contain unique positive fold IDs")
     folds = {}
     all_test = []
-    for fold in range(1, N_FOLDS + 1):
+    reference_all = None
+    for fold in selected_folds:
         split_dir = resolve_split_dir(split_root, fold)
         gauged = read_basin_list(split_dir / "gauged_basins.txt")
         ungauged = read_basin_list(split_dir / "ungauged_basins.txt")
+        if not gauged or not ungauged:
+            raise RuntimeError(f"fold_{fold}: empty train or test basin list")
         if set(gauged) & set(ungauged):
             raise RuntimeError(f"fold_{fold}: gauged and ungauged overlap")
+        universe = set(gauged) | set(ungauged)
+        if reference_all is None:
+            reference_all = universe
+        elif len(selected_folds) > 1 and reference_all != universe:
+            raise RuntimeError(f"fold_{fold}: basin universe mismatch")
         folds[fold] = (gauged, ungauged)
         all_test.extend(ungauged)
     if len(all_test) != len(set(all_test)):
         raise RuntimeError("A PUB test basin appears in more than one fold")
+    if selected_folds == list(range(1, N_FOLDS + 1)) and set(all_test) != reference_all:
+        raise RuntimeError("Test folds do not cover the full basin set exactly once")
     return folds
 
 
@@ -243,13 +257,14 @@ def resolve_artifacts(
     pt_root: Path,
     meta_root: Path,
     mst_root: Path,
+    attributes_db: Path | None = None,
 ) -> tuple[Path, Path, Path, Path, Path]:
     if model_name == "global":
         model_dir = global_root / f"seed{seed}" / f"fold_{fold}"
         model_path = model_dir / "model_best.pt"
         cfg_path = model_dir / "run_cfg.json"
         norm_path = model_dir / "static_norm.json"
-        db_path = global_root / "shared_data" / f"fold_{fold}" / "attributes_filtered.db"
+        db_path = global_root / "shared_data" / f"fold_{fold}" / "attributes.db"
         scaler_path = model_dir / "dynamic_output_scaler.json"
     elif model_name == "cluster":
         if cluster_id is None:
@@ -258,7 +273,7 @@ def resolve_artifacts(
         model_path = model_dir / "model_best.pt"
         cfg_path = model_dir / "run_cfg.json"
         norm_path = model_dir / "static_norm.json"
-        db_path = cluster_root / "shared_data" / f"fold_{fold}" / "attributes_filtered.db"
+        db_path = cluster_root / "shared_data" / f"fold_{fold}" / "attributes.db"
         scaler_path = model_dir / "dynamic_output_scaler.json"
     elif model_name == "pretrain_finetune":
         if cluster_id is None:
@@ -267,7 +282,7 @@ def resolve_artifacts(
         model_path = model_dir / "model_best.pt"
         cfg_path = model_dir / "run_cfg.json"
         norm_path = global_root / f"seed{seed}" / f"fold_{fold}" / "static_norm.json"
-        db_path = global_root / "shared_data" / f"fold_{fold}" / "attributes_filtered.db"
+        db_path = global_root / "shared_data" / f"fold_{fold}" / "attributes.db"
         scaler_path = model_dir / "dynamic_output_scaler.json"
     elif model_name == "meta_finetune":
         if cluster_id is None:
@@ -276,10 +291,12 @@ def resolve_artifacts(
         model_path = model_dir / "model_best.pt"
         cfg_path = model_dir / "run_cfg.json"
         norm_path = meta_root / f"seed{seed}" / f"fold_{fold}" / "static_norm.json"
-        db_path = meta_root / "shared_data" / f"fold_{fold}" / "attributes_filtered.db"
+        db_path = meta_root / "shared_data" / f"fold_{fold}" / "attributes.db"
         scaler_path = model_dir / "dynamic_output_scaler.json"
     else:
         raise ValueError(model_name)
+    if attributes_db is not None:
+        db_path = attributes_db
     for path in [model_path, cfg_path, norm_path, db_path, scaler_path]:
         if not path.exists():
             raise FileNotFoundError(path)
@@ -352,6 +369,9 @@ def predict_basin(
     scaler = load_dynamic_output_scaler(scaler_path)
     install_scaler(scaler)
     cfg = load_json(cfg_path)
+    trained_seq = int(cfg.get("seq_length", SEQ_LENGTH))
+    if trained_seq != SEQ_LENGTH:
+        raise RuntimeError(f"Checkpoint seq_length={trained_seq}, evaluation seq_length={SEQ_LENGTH}; set --seq_length accordingly")
     hidden_size = int(cfg["hidden_size"])
     dropout = float(cfg.get("dropout", 0.4))
     means, stds, columns = load_static_norm(norm_path)
@@ -440,6 +460,7 @@ def evaluate_one_model(
     clip_negative: bool,
     save_timeseries: bool,
     allow_missing: bool,
+    attributes_db: Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     model_label = MODEL_LABELS[model_name]
     model_out = output_root / model_name
@@ -466,6 +487,7 @@ def evaluate_one_model(
                         pt_root,
                         meta_root,
                         mst_root,
+                        attributes_db=attributes_db,
                     )
                     obs, sim, dates = predict_basin(
                         camels_root,
@@ -597,11 +619,17 @@ def build_pairwise_comparisons(ensemble_by_model: dict[str, pd.DataFrame], outpu
 
 
 def main() -> None:
+    global TEST_START, TEST_END, SEQ_LENGTH
     parser = argparse.ArgumentParser()
     parser.add_argument("--models", nargs="+", choices=MODEL_ORDER, default=MODEL_ORDER)
     parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
     parser.add_argument("--folds", nargs="+", type=int, default=list(range(1, N_FOLDS + 1)))
     parser.add_argument("--camels_root", type=Path, default=DEFAULT_CAMELS_ROOT)
+    parser.add_argument("--attributes_db", type=Path, default=None,
+                        help="Optional full CAMELS attributes.db with ALL test basins; model norm remains training-only")
+    parser.add_argument("--test_start", type=str, default=TEST_START)
+    parser.add_argument("--test_end", type=str, default=TEST_END)
+    parser.add_argument("--seq_length", type=int, default=SEQ_LENGTH)
     parser.add_argument("--split_root", type=Path, default=DEFAULT_SPLIT_ROOT)
     parser.add_argument("--cluster_info_root", type=Path, default=DEFAULT_CLUSTER_INFO_ROOT)
     parser.add_argument("--global_root", type=Path, default=DEFAULT_GLOBAL_ROOT)
@@ -616,8 +644,13 @@ def main() -> None:
     parser.add_argument("--save_timeseries", action="store_true")
     parser.add_argument("--allow_missing", action="store_true")
     args = parser.parse_args()
+    TEST_START, TEST_END, SEQ_LENGTH = args.test_start, args.test_end, args.seq_length
+    if SEQ_LENGTH < 1 or pd.Timestamp(TEST_START) > pd.Timestamp(TEST_END):
+        raise ValueError("Invalid --seq_length or test period")
+    if args.attributes_db is not None and not args.attributes_db.is_file():
+        raise FileNotFoundError(args.attributes_db)
     args.output_root.mkdir(parents=True, exist_ok=True)
-    splits = load_splits(args.split_root)
+    splits = load_splits(args.split_root, args.folds)
     print(f"[device] {DEVICE}")
     print(f"[test] {TEST_START} -> {TEST_END}")
     print(f"[models] {[MODEL_LABELS[x] for x in args.models]}")
@@ -648,6 +681,7 @@ def main() -> None:
             args.clip_negative,
             args.save_timeseries,
             args.allow_missing,
+            attributes_db=args.attributes_db,
         )
         if not summary_df.empty:
             all_summaries.append(summary_df)

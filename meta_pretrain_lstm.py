@@ -35,7 +35,7 @@ TRAIN_START = "1989-10-01"
 TRAIN_END = "1999-09-30"
 TEST_START = "1999-10-01"
 TEST_END = "2004-09-30"
-SEEDS = [12345, 1234, 123]
+SEEDS = [12345, 1234, 123,12,1]
 N_FOLDS = 5
 N_CLUSTERS = 8
 SEQ_LENGTH = 270
@@ -45,7 +45,7 @@ SUPPORT_FRAC = 0.8
 INNER_STEPS = 5
 INNER_LR = 0.005
 META_LR = 1e-3
-HIDDEN_SIZE = 256
+HIDDEN_SIZE = 80  # MST meta-pretraining; also use 80 for meta fine-tuning
 DROPOUT = 0.4
 BATCH_SIZE = 256
 GRAD_CLIP = 1.0
@@ -64,6 +64,48 @@ def normalize_basin_id(value: Any) -> str:
     if not digits:
         raise ValueError(f"Invalid basin id: {value!r}")
     return digits.zfill(8)
+
+
+
+
+def apply_cli_overrides(args: argparse.Namespace, fields: dict[str, str]) -> None:
+    """Apply explicit CLI values to the existing training constants without changing helper APIs."""
+    for arg_name, constant_name in fields.items():
+        globals()[constant_name] = getattr(args, arg_name)
+
+
+def check_positive_settings() -> None:
+    for key in ("META_EPOCHS", "META_BATCH_SIZE", "BATCH_SIZE", "SEQ_LENGTH", "HIDDEN_SIZE", "INNER_STEPS"):
+        if int(globals()[key]) < 1:
+            raise ValueError(f"{key} must be positive")
+    if not (0 <= DROPOUT < 1):
+        raise ValueError("dropout must be in [0, 1)")
+    if GRAD_CLIP <= 0:
+        raise ValueError("grad_clip must be positive")
+
+
+def ensure_cache_matches(h5_path: Path, scaler_path: Path, gauged: list[str]) -> None:
+    """Do not silently reuse H5 from a different fold/sequence length."""
+    if h5_path.exists():
+        with h5py.File(h5_path, "r") as f:
+            if "input_data" not in f or "sample_2_basin" not in f:
+                raise RuntimeError(f"Unrecognized H5 schema: {h5_path}")
+            actual_seq = int(f["input_data"].shape[1])
+            if actual_seq != SEQ_LENGTH:
+                raise RuntimeError(f"{h5_path}: cached seq_length={actual_seq}, requested={SEQ_LENGTH}; use a NEW output_root")
+            cached_basins = set(np.char.decode(f["sample_2_basin"][:], "ascii").tolist())
+            if not cached_basins.issubset(set(gauged)) or not set(gauged).issubset(cached_basins):
+                raise RuntimeError(f"{h5_path}: cached basin set differs from the selected fold; use a NEW output_root")
+
+
+def protect_shared_rebuild(output_root: Path, fold: int) -> None:
+    """Rebuilding inputs underneath trained checkpoints would invalidate resume."""
+    found = []
+    for p in output_root.glob(f"seed*/fold_{fold}/**/*.pt"):
+        found.append(p)
+        break
+    if found:
+        raise RuntimeError(f"Refusing shared-data rebuild for fold_{fold}: model checkpoints exist under {output_root}. Use a NEW output_root")
 
 
 def read_basin_list(path: Path) -> list[str]:
@@ -176,11 +218,15 @@ def find_split_dir(split_root: Path, fold: int) -> Path:
     raise FileNotFoundError(f"Missing split files for fold_{fold} under {split_root}")
 
 
-def load_splits(split_root: Path) -> dict[int, tuple[list[str], list[str]]]:
+def load_splits(split_root: Path, selected_folds: list[int] | None = None) -> dict[int, tuple[list[str], list[str]]]:
+    if selected_folds is None:
+        selected_folds = list(range(1, N_FOLDS + 1))
+    if not selected_folds or len(set(selected_folds)) != len(selected_folds):
+        raise ValueError("--folds must list unique positive fold IDs")
     folds = {}
     reference_all = None
     seen_test = []
-    for fold in range(1, N_FOLDS + 1):
+    for fold in selected_folds:
         split_dir = find_split_dir(split_root, fold)
         gauged = read_basin_list(split_dir / "gauged_basins.txt")
         ungauged = read_basin_list(split_dir / "ungauged_basins.txt")
@@ -197,7 +243,7 @@ def load_splits(split_root: Path) -> dict[int, tuple[list[str], list[str]]]:
         raise RuntimeError("No folds found")
     if len(seen_test) != len(set(seen_test)):
         raise RuntimeError("A test basin appears in more than one fold")
-    if sorted(seen_test) != reference_all:
+    if selected_folds == list(range(1, N_FOLDS + 1)) and sorted(seen_test) != reference_all:
         raise RuntimeError("Five-fold test basins do not cover the full basin set exactly once")
     return folds
 
@@ -258,6 +304,7 @@ def prepare_shared_data(camels_root: Path, output_root: Path, fold: int, gauged:
     scaler_path = shared_dir / "dynamic_output_scaler.json"
     h5_path = shared_dir / "train.h5"
     if force:
+        protect_shared_rebuild(output_root, fold)
         for path in [raw_db, filtered_db, scaler_path, h5_path]:
             if path.exists():
                 path.unlink()
@@ -281,6 +328,7 @@ def prepare_shared_data(camels_root: Path, output_root: Path, fold: int, gauged:
             with_basin_str=True,
             seq_length=SEQ_LENGTH,
         )
+    ensure_cache_matches(h5_path, scaler_path, gauged)
     return filtered_db, h5_path, scaler_path, scaler
 
 
@@ -443,12 +491,26 @@ def load_checkpoint(path: Path, model: MetaLSTMModel, rng: random.Random) -> tup
 
 
 def train_one(seed: int, fold: int, gauged: list[str], cluster_members: dict[int, list[str]], filtered_db: Path, h5_path: Path, scaler_path: Path, scaler: dict[str, Any], out_dir: Path, num_workers: int) -> None:
+    # Refuse to reuse/skip historical 256-unit checkpoints for the new 80-unit MST.
+    cfg_path = out_dir / "run_cfg.json"
+    if cfg_path.exists():
+        saved = load_json(cfg_path)
+        required = {"hidden_size": HIDDEN_SIZE, "seed": seed, "fold": fold, "meta_epochs": META_EPOCHS,
+                    "meta_batch_size": META_BATCH_SIZE, "support_frac": SUPPORT_FRAC,
+                    "inner_steps": INNER_STEPS, "inner_lr": INNER_LR, "meta_lr": META_LR,
+                    "dropout": DROPOUT, "batch_size": BATCH_SIZE, "grad_clip": GRAD_CLIP,
+                    "seq_length": SEQ_LENGTH}
+        wrong = {k: (saved.get(k), v) for k, v in required.items() if saved.get(k) != v}
+        if wrong:
+            raise RuntimeError(f"Incompatible meta-pretrain run at {out_dir}: {wrong}. Use --output_root for a separate 80-unit run; never overwrite old checkpoints.")
+    elif any((out_dir / name).exists() for name in ("checkpoint_latest.pt", "checkpoint_best.pt", "meta_pretrained_best.pt", "meta_pretrained_final.pt", "TRAIN_DONE.json")):
+        raise RuntimeError(f"Existing meta-pretrain artifacts lack run_cfg.json: {out_dir}; refusing to overwrite")
     out_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(scaler_path, out_dir / "dynamic_output_scaler.json")
     done_path = out_dir / "TRAIN_DONE.json"
     if done_path.exists():
         print(f"[skip] seed={seed} fold={fold} completed")
         return
+    shutil.copy2(scaler_path, out_dir / "dynamic_output_scaler.json")
     install_scaler(scaler)
     set_seed(seed)
     ds = CamelsH5(
@@ -610,10 +672,27 @@ def main() -> None:
     parser.add_argument("--output_root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
     parser.add_argument("--folds", nargs="+", type=int, default=list(range(1, N_FOLDS + 1)))
+    parser.add_argument("--meta_epochs", type=int, default=META_EPOCHS)
+    parser.add_argument("--meta_batch_size", type=int, default=META_BATCH_SIZE)
+    parser.add_argument("--support_frac", type=float, default=SUPPORT_FRAC)
+    parser.add_argument("--inner_steps", type=int, default=INNER_STEPS)
+    parser.add_argument("--inner_lr", type=float, default=INNER_LR)
+    parser.add_argument("--meta_lr", type=float, default=META_LR)
+    parser.add_argument("--hidden_size", type=int, default=HIDDEN_SIZE)
+    parser.add_argument("--dropout", type=float, default=DROPOUT)
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--seq_length", type=int, default=SEQ_LENGTH)
+    parser.add_argument("--grad_clip", type=float, default=GRAD_CLIP)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--force_rebuild_shared_data", action="store_true")
     args = parser.parse_args()
-    folds = load_splits(args.split_root)
+    apply_cli_overrides(args, {name.lower(): name for name in (
+        "META_EPOCHS", "META_BATCH_SIZE", "SUPPORT_FRAC", "INNER_STEPS", "INNER_LR", "META_LR",
+        "HIDDEN_SIZE", "DROPOUT", "BATCH_SIZE", "SEQ_LENGTH", "GRAD_CLIP")})
+    check_positive_settings()
+    if not 0 < SUPPORT_FRAC < 1 or INNER_LR <= 0 or META_LR <= 0:
+        raise ValueError("Support fraction must be (0,1); learning rates must be positive")
+    folds = load_splits(args.split_root, args.folds)
     shared = {}
     for fold in args.folds:
         gauged, _ = folds[fold]

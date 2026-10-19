@@ -8,6 +8,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import h5py
+
 import numpy as np
 import pandas as pd
 import torch
@@ -31,8 +33,10 @@ TRAIN_END = "1999-09-30"
 TEST_START = "1999-10-01"
 TEST_END = "2004-09-30"
 
-SEEDS = [12345, 1234, 123]
+SEEDS = [12345, 1234, 123,12,1]
 N_FOLDS = 5
+LR_STAGE1_END = 10
+LR_STAGE2_END = 20
 SEQ_LENGTH = 270
 EPOCHS = 30
 BATCH_SIZE = 2000
@@ -48,6 +52,48 @@ FORGET_GATE_BIAS = 5
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 DYNAMIC_COLUMNS = ["PRCP(mm/day)", "SRAD(W/m2)", "Tmax(C)", "Tmin(C)", "Vp(Pa)"]
 SCALER_PROTOCOL = "fold_training_period"
+
+
+
+
+def apply_cli_overrides(args: argparse.Namespace, fields: dict[str, str]) -> None:
+    """Apply explicit CLI values to the existing training constants without changing helper APIs."""
+    for arg_name, constant_name in fields.items():
+        globals()[constant_name] = getattr(args, arg_name)
+
+
+def check_positive_settings() -> None:
+    for key in ("EPOCHS", "BATCH_SIZE", "SEQ_LENGTH", "HIDDEN_SIZE"):
+        if int(globals()[key]) < 1:
+            raise ValueError(f"{key} must be positive")
+    if not (0 <= DROPOUT < 1):
+        raise ValueError("dropout must be in [0, 1)")
+    if GRAD_CLIP <= 0:
+        raise ValueError("grad_clip must be positive")
+
+
+def ensure_cache_matches(h5_path: Path, scaler_path: Path, gauged: list[str]) -> None:
+    """Do not silently reuse H5 from a different fold/sequence length."""
+    if h5_path.exists():
+        with h5py.File(h5_path, "r") as f:
+            if "input_data" not in f or "sample_2_basin" not in f:
+                raise RuntimeError(f"Unrecognized H5 schema: {h5_path}")
+            actual_seq = int(f["input_data"].shape[1])
+            if actual_seq != SEQ_LENGTH:
+                raise RuntimeError(f"{h5_path}: cached seq_length={actual_seq}, requested={SEQ_LENGTH}; use a NEW output_root")
+            cached_basins = set(np.char.decode(f["sample_2_basin"][:], "ascii").tolist())
+            if not cached_basins.issubset(set(gauged)) or not set(gauged).issubset(cached_basins):
+                raise RuntimeError(f"{h5_path}: cached basin set differs from the selected fold; use a NEW output_root")
+
+
+def protect_shared_rebuild(output_root: Path, fold: int) -> None:
+    """Rebuilding inputs underneath trained checkpoints would invalidate resume."""
+    found = []
+    for p in output_root.glob(f"seed*/fold_{fold}/**/*.pt"):
+        found.append(p)
+        break
+    if found:
+        raise RuntimeError(f"Refusing shared-data rebuild for fold_{fold}: model checkpoints exist under {output_root}. Use a NEW output_root")
 
 
 def save_json(path: Path, obj: Any) -> None:
@@ -103,11 +149,17 @@ def find_gauged_list(split_dir: Path) -> Path:
 
 
 def kratzert_lr(epoch: int) -> float:
-    if epoch <= 10:
+    if epoch <= LR_STAGE1_END:
         return LR_STAGE1
-    if epoch <= 20:
+    if epoch <= LR_STAGE2_END:
         return LR_STAGE2
     return LR_STAGE3
+
+
+def lr_schedule_label() -> str:
+    if (LR_STAGE1, LR_STAGE2, LR_STAGE3, LR_STAGE1_END, LR_STAGE2_END) == (1e-3, 5e-4, 1e-4, 10, 20):
+        return "kratzert2019_1e-3_5e-4_1e-4"
+    return f"three_stage_{LR_STAGE1:g}_{LR_STAGE2:g}_{LR_STAGE3:g}_at_{LR_STAGE1_END}_{LR_STAGE2_END}"
 
 
 def set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
@@ -252,10 +304,17 @@ class GlobalLSTMModel(nn.Module):
         return self.fc(self.dropout(h[:, -1, :]))
 
 
-def validate_splits(split_root: Path) -> dict[int, list[str]]:
+def validate_splits(split_root: Path, selected_folds: list[int] | None = None) -> dict[int, list[str]]:
+    if selected_folds is None:
+        selected_folds = list(range(1, N_FOLDS + 1))
+    if not selected_folds or len(set(selected_folds)) != len(selected_folds):
+        raise ValueError("--folds must be a nonempty list of unique positive fold IDs")
     folds: dict[int, list[str]] = {}
     all_test: list[str] = []
-    for fold in range(1, N_FOLDS + 1):
+    reference_all = None
+    for fold in selected_folds:
+        if fold < 1:
+            raise ValueError("Fold IDs must be positive")
         split_dir = split_root / f"fold_{fold}" / "split"
         if not split_dir.exists():
             split_dir = split_root / f"fold_{fold}"
@@ -266,13 +325,22 @@ def validate_splits(split_root: Path) -> dict[int, list[str]]:
         if not ungauged_file.exists():
             raise FileNotFoundError(ungauged_file)
         ungauged = read_basin_list(ungauged_file)
+        if not gauged or not ungauged:
+            raise RuntimeError(f"fold_{fold}: empty training or test basin list")
         if set(gauged) & set(ungauged):
             raise RuntimeError(f"fold_{fold}: gauged and ungauged basins overlap")
+        union = set(gauged) | set(ungauged)
+        if reference_all is None:
+            reference_all = union
+        elif len(selected_folds) > 1 and union != reference_all:
+            raise RuntimeError(f"fold_{fold}: inconsistent basin universe")
         folds[fold] = gauged
         all_test.extend(ungauged)
         print(f"[split] fold={fold} gauged={len(gauged)} ungauged={len(ungauged)}")
     if len(all_test) != len(set(all_test)):
         raise RuntimeError("A test basin appears in more than one fold")
+    if selected_folds == list(range(1, N_FOLDS + 1)) and set(all_test) != reference_all:
+        raise RuntimeError("Five-fold test lists do not cover the complete basin set")
     print(f"[split] unique test basins={len(set(all_test))}")
     return folds
 
@@ -291,6 +359,7 @@ def prepare_shared_data(
     scaler_path = shared_dir / "dynamic_output_scaler.json"
     h5_path = shared_dir / "train.h5"
     if force_rebuild:
+        protect_shared_rebuild(output_root, fold)
         for path in [raw_db, filtered_db, scaler_path, h5_path]:
             if path.exists():
                 path.unlink()
@@ -314,6 +383,7 @@ def prepare_shared_data(
             with_basin_str=True,
             seq_length=SEQ_LENGTH,
         )
+    ensure_cache_matches(h5_path, scaler_path, gauged_basins)
     return filtered_db, h5_path, scaler_path, scaler
 
 
@@ -331,12 +401,14 @@ def validate_existing_run(out_dir: Path, seed: int, fold: int) -> None:
         "batch_size": BATCH_SIZE,
         "hidden_size": HIDDEN_SIZE,
         "dropout": DROPOUT,
-        "lr_schedule": "kratzert2019_1e-3_5e-4_1e-4",
+        "lr_schedule": lr_schedule_label(),
         "dynamic_output_scaler_scope": SCALER_PROTOCOL,
     }
+    expected.update({"seq_length": SEQ_LENGTH, "weight_decay": WEIGHT_DECAY, "grad_clip": GRAD_CLIP,
+                     "lr_epoch_1_10": LR_STAGE1, "lr_epoch_11_20": LR_STAGE2, "lr_epoch_21_30": LR_STAGE3})
     for key, value in expected.items():
-        if cfg.get(key) != value:
-            raise RuntimeError(f"Existing run_cfg.json does not match current setting: {key}")
+        if key in cfg and cfg.get(key) != value:
+            raise RuntimeError(f"Existing run_cfg.json does not match current setting: {key}; use a NEW output_root")
 
 
 def train_one(
@@ -350,8 +422,10 @@ def train_one(
     out_dir: Path,
     num_workers: int,
 ) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
     validate_existing_run(out_dir, seed, fold)
+    if not (out_dir / "run_cfg.json").exists() and any((out_dir / p).exists() for p in ("checkpoint_latest.pt", "model_best.pt", "TRAIN_DONE.json")):
+        raise RuntimeError(f"Old checkpoints without run_cfg.json: {out_dir}; refusing to overwrite")
+    out_dir.mkdir(parents=True, exist_ok=True)
     done_path = out_dir / "TRAIN_DONE.json"
     ckpt_path = out_dir / "checkpoint_latest.pt"
     model_path = out_dir / "model_best.pt"
@@ -409,12 +483,14 @@ def train_one(
             "hidden_size": HIDDEN_SIZE,
             "dropout": DROPOUT,
             "weight_decay": WEIGHT_DECAY,
-            "lr_schedule": "kratzert2019_1e-3_5e-4_1e-4",
+            "lr_schedule": lr_schedule_label(),
             "lr_epoch_1_10": LR_STAGE1,
             "lr_epoch_11_20": LR_STAGE2,
             "lr_epoch_21_30": LR_STAGE3,
+            "lr_stage1_end": LR_STAGE1_END,
+            "lr_stage2_end": LR_STAGE2_END,
             "grad_clip": GRAD_CLIP,
-            "model_selection": "final_epoch_30",
+            "model_selection": f"final_epoch_{EPOCHS}",
             "h5": relative_string(h5_path),
             "attributes_db": relative_string(filtered_db),
             "dynamic_output_scaler": relative_string(out_dir / "dynamic_output_scaler.json"),
@@ -473,7 +549,7 @@ def train_one(
             "reason": "max_epochs",
             "epoch": last_epoch,
             "best_score": best_score,
-            "model_selection": "final_epoch_30",
+            "model_selection": f"final_epoch_{EPOCHS}",
             "seed": seed,
             "fold": fold,
             "dynamic_output_scaler_scope": SCALER_PROTOCOL,
@@ -488,9 +564,28 @@ def main() -> None:
     parser.add_argument("--split_root", type=Path, default=DEFAULT_SPLIT_ROOT)
     parser.add_argument("--output_root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
+    parser.add_argument("--folds", nargs="+", type=int, default=list(range(1, N_FOLDS + 1)), help="Select one or more split folds, e.g. --folds 1")
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--hidden_size", type=int, default=HIDDEN_SIZE)
+    parser.add_argument("--dropout", type=float, default=DROPOUT)
+    parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--seq_length", type=int, default=SEQ_LENGTH)
+    parser.add_argument("--grad_clip", type=float, default=GRAD_CLIP)
+    parser.add_argument("--lr_stage1", type=float, default=LR_STAGE1)
+    parser.add_argument("--lr_stage2", type=float, default=LR_STAGE2)
+    parser.add_argument("--lr_stage3", type=float, default=LR_STAGE3)
+    parser.add_argument("--lr_stage1_end", type=int, default=LR_STAGE1_END)
+    parser.add_argument("--lr_stage2_end", type=int, default=LR_STAGE2_END)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--force_rebuild_shared_data", action="store_true")
     args = parser.parse_args()
+    apply_cli_overrides(args, {name.lower(): name for name in (
+        "EPOCHS", "BATCH_SIZE", "HIDDEN_SIZE", "DROPOUT", "WEIGHT_DECAY", "SEQ_LENGTH", "GRAD_CLIP",
+        "LR_STAGE1", "LR_STAGE2", "LR_STAGE3", "LR_STAGE1_END", "LR_STAGE2_END")})
+    check_positive_settings()
+    if not 0 < LR_STAGE1_END < LR_STAGE2_END or min(LR_STAGE1, LR_STAGE2, LR_STAGE3) <= 0:
+        raise ValueError("Learning-rate stages must have increasing end epochs and positive rates")
     camels_root = args.camels_root if args.camels_root.is_absolute() else ROOT / args.camels_root
     split_root = args.split_root if args.split_root.is_absolute() else ROOT / args.split_root
     output_root = args.output_root if args.output_root.is_absolute() else ROOT / args.output_root
@@ -506,9 +601,9 @@ def main() -> None:
     print(f"[train] {TRAIN_START} -> {TRAIN_END}")
     print(f"[test] {TEST_START} -> {TEST_END}")
     print(f"[seeds] {args.seeds}")
-    fold_gauged = validate_splits(split_root)
+    fold_gauged = validate_splits(split_root, args.folds)
     shared: dict[int, tuple[Path, Path, Path, dict[str, Any]]] = {}
-    for fold in range(1, N_FOLDS + 1):
+    for fold in args.folds:
         shared[fold] = prepare_shared_data(
             camels_root,
             output_root,
@@ -517,7 +612,7 @@ def main() -> None:
             args.force_rebuild_shared_data,
         )
     for seed in args.seeds:
-        for fold in range(1, N_FOLDS + 1):
+        for fold in args.folds:
             filtered_db, h5_path, scaler_path, scaler = shared[fold]
             install_scaler(scaler)
             train_one(

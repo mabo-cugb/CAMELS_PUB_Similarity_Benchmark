@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import shutil
 from pathlib import Path
@@ -31,14 +32,20 @@ TRAIN_START = "1989-10-01"
 TRAIN_END = "1999-09-30"
 TEST_START = "1999-10-01"
 TEST_END = "2004-09-30"
-SEEDS = [12345, 1234, 123]
+SEEDS = [12345, 1234, 123,12,1]
 N_FOLDS = 5
 N_CLUSTERS = 8
 SEQ_LENGTH = 270
-EPOCHS = 30
-LR = 3e-4
+EPOCHS = 70  # Runtime selected by init_type: PTST=10, MST=70
+LR = 3e-4  # Runtime default: PTST=6e-4, MST=3e-4
+PTST_EPOCHS = 10
+PTST_LR = 6e-4
+MST_EPOCHS = 70
+MST_LR = 3e-4
+EARLY_STOPPING = True  # Runtime PTST=False, MST=True
 BATCH_SIZE = 256
-HIDDEN_SIZE = 256
+HIDDEN_SIZE = 256       # PTST: initialized from 256-unit Global model
+META_HIDDEN_SIZE = 80  # MST: initialized from 80-unit Meta model
 DROPOUT = 0.4
 WEIGHT_DECAY = 0.0
 LR_PATIENCE = 4
@@ -49,6 +56,26 @@ GRAD_CLIP = 1.0
 FORGET_GATE_BIAS = 5
 DYN_INPUT_SIZE = 5
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def apply_cli_overrides(args: argparse.Namespace) -> None:
+    for name in ("EPOCHS", "LR", "BATCH_SIZE", "DROPOUT", "WEIGHT_DECAY", "LR_PATIENCE", "LR_FACTOR",
+                 "MIN_LR", "MAX_LR_DECAYS", "GRAD_CLIP", "SEQ_LENGTH"):
+        globals()[name] = getattr(args, name.lower())
+    globals()["EARLY_STOPPING"] = args.early_stopping
+    globals()["HIDDEN_SIZE"] = args.global_hidden_size
+    globals()["META_HIDDEN_SIZE"] = args.meta_hidden_size
+    globals()["N_CLUSTERS"] = args.n_clusters
+    if EPOCHS < 1 or BATCH_SIZE < 1 or LR <= 0 or MIN_LR <= 0 or LR_PATIENCE < 1 or MAX_LR_DECAYS < 0 or not 0 < LR_FACTOR < 1 or not 0 <= DROPOUT < 1 or GRAD_CLIP <= 0 or HIDDEN_SIZE < 1 or META_HIDDEN_SIZE < 1 or SEQ_LENGTH < 1 or N_CLUSTERS < 1:
+        raise ValueError("Invalid fine-tuning hyperparameters")
 
 
 def normalize_basin_id(value: Any) -> str:
@@ -84,9 +111,11 @@ def find_split_dir(split_root: Path, fold: int) -> Path:
     raise FileNotFoundError(f"Missing split files for fold_{fold} under {split_root}")
 
 
-def load_splits(split_root: Path) -> dict[int, tuple[list[str], list[str]]]:
+def load_splits(split_root: Path, selected_folds: list[int] | None = None) -> dict[int, tuple[list[str], list[str]]]:
+    if selected_folds is None:
+        selected_folds = list(range(1, N_FOLDS + 1))
     folds = {}
-    for fold in range(1, N_FOLDS + 1):
+    for fold in selected_folds:
         split_dir = find_split_dir(split_root, fold)
         gauged = read_basin_list(split_dir / "gauged_basins.txt")
         ungauged = read_basin_list(split_dir / "ungauged_basins.txt")
@@ -217,13 +246,36 @@ def load_static_norm(path: Path) -> tuple[pd.Series, pd.Series, list[str]]:
 
 
 def train_one_cluster(init_type: str, seed: int, fold: int, cid: int, member_basins: list[str], gauged: list[str], model_path: Path, filtered_db: Path, h5_path: Path, norm_path: Path, scaler_path: Path, output_root: Path, num_workers: int) -> None:
+    # PTST retains the trained 256-unit Global architecture; MST uses 80 units.
+    hidden_size = HIDDEN_SIZE if init_type == "global" else META_HIDDEN_SIZE
     out_dir = output_root / f"seed{seed}" / f"fold_{fold}" / f"cluster_{cid}"
+    cfg_path = out_dir / "run_cfg.json"
+    if cfg_path.exists():
+        saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+        required = {"hidden_size": hidden_size, "init_type": init_type, "seed": seed, "fold": fold,
+                    "cluster_id": cid, "epochs": EPOCHS, "lr": LR, "batch_size": BATCH_SIZE,
+                    "dropout": DROPOUT, "lr_patience": LR_PATIENCE, "lr_factor": LR_FACTOR,
+                    "min_lr": MIN_LR, "max_lr_decays": MAX_LR_DECAYS, "grad_clip": GRAD_CLIP,
+                    "seq_length": SEQ_LENGTH, "weight_decay": WEIGHT_DECAY}
+        if "early_stopping" in saved:
+            required["early_stopping"] = EARLY_STOPPING
+        wrong = {k: (saved.get(k), v) for k, v in required.items() if saved.get(k) != v}
+        if wrong:
+            raise RuntimeError(f"Incompatible fine-tune run at {out_dir}: {wrong}. Use --output_root for a separate 80-unit MST run; never overwrite old checkpoints.")
+    elif any((out_dir / name).exists() for name in ("checkpoint_latest.pt", "checkpoint_best.pt", "model_best.pt", "TRAIN_DONE.json")):
+        raise RuntimeError(f"Existing fine-tuning artifacts lack run_cfg.json: {out_dir}; refusing to overwrite")
     out_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(scaler_path, out_dir / "dynamic_output_scaler.json")
     done_path = out_dir / "TRAIN_DONE.json"
     if done_path.exists():
         print(f"[skip] {init_type} seed={seed} fold={fold} cluster={cid} completed")
         return
+    # Reject a 256-unit meta initialization before touching any saved outputs.
+    initial_state = load_state(model_path)
+    initial_h = int(initial_state["lstm.weight_hh"].shape[0])
+    if initial_h != hidden_size:
+        raise RuntimeError(f"{init_type} initialization hidden size is {initial_h}, expected {hidden_size}: {model_path}. Set --init_root to the matching pretraining run.")
+    set_seed(seed + cid)
+    shutil.copy2(scaler_path, out_dir / "dynamic_output_scaler.json")
     means, stds, columns = load_static_norm(norm_path)
     ds = CamelsH5(
         h5_file=h5_path,
@@ -241,12 +293,15 @@ def train_one_cluster(init_type: str, seed: int, fold: int, cid: int, member_bas
     ds.attribute_stds = stds
     ds.attribute_names = columns
     with h5py.File(str(h5_path), "r") as f:
+        actual_seq = int(f["input_data"].shape[1])
+        if actual_seq != SEQ_LENGTH:
+            raise RuntimeError(f"Fine-tuning H5 seq_length={actual_seq}, requested={SEQ_LENGTH}. Match pretraining settings.")
         basin_strings = np.char.decode(f["sample_2_basin"][:], "ascii")
     indices = np.where(np.isin(basin_strings, np.asarray(member_basins)))[0].astype(int)
     if len(indices) == 0:
         raise RuntimeError(f"No samples found for cluster {cid}")
     loader = DataLoader(Subset(ds, indices), batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-    model = LSTMModel(DYN_INPUT_SIZE, len(columns), HIDDEN_SIZE, DROPOUT).to(DEVICE)
+    model = LSTMModel(DYN_INPUT_SIZE, len(columns), hidden_size, DROPOUT).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     loss_fn = NSELoss()
     latest_path = out_dir / "checkpoint_latest.pt"
@@ -272,7 +327,7 @@ def train_one_cluster(init_type: str, seed: int, fold: int, cid: int, member_bas
         bad_lr = int(ckpt.get("bad_lr", 0))
         lr_decays = int(ckpt.get("lr_decays", 0))
     else:
-        model.load_state_dict(load_state(model_path), strict=True)
+        model.load_state_dict(initial_state, strict=True)
     save_json(
         out_dir / "run_cfg.json",
         {
@@ -291,7 +346,7 @@ def train_one_cluster(init_type: str, seed: int, fold: int, cid: int, member_bas
             "epochs": EPOCHS,
             "lr": LR,
             "batch_size": BATCH_SIZE,
-            "hidden_size": HIDDEN_SIZE,
+            "hidden_size": hidden_size,
             "dropout": DROPOUT,
             "weight_decay": WEIGHT_DECAY,
             "lr_patience": LR_PATIENCE,
@@ -302,6 +357,8 @@ def train_one_cluster(init_type: str, seed: int, fold: int, cid: int, member_bas
             "static_norm_scope": "all_gauged_current_fold",
             "dynamic_output_scaler": str(out_dir / "dynamic_output_scaler.json"),
             "full_parameter_finetune": True,
+            "early_stopping": EARLY_STOPPING,
+            "model_selection": "lowest_train_loss_model_best",
         },
     )
     stop_reason = "max_epochs"
@@ -347,7 +404,7 @@ def train_one_cluster(init_type: str, seed: int, fold: int, cid: int, member_bas
         bad_lr = 0 if significant else bad_lr + 1
         rollback = False
         early_stop = False
-        if bad_lr >= LR_PATIENCE:
+        if EARLY_STOPPING and bad_lr >= LR_PATIENCE:
             current_lr = float(optimizer.param_groups[0]["lr"])
             new_lr = max(current_lr * LR_FACTOR, MIN_LR)
             if new_lr < current_lr and lr_decays < MAX_LR_DECAYS:
@@ -417,13 +474,36 @@ def main() -> None:
     parser.add_argument("--output_root", type=Path, default=None)
     parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
     parser.add_argument("--folds", nargs="+", type=int, default=list(range(1, N_FOLDS + 1)))
+    parser.add_argument("--n_clusters", type=int, default=N_CLUSTERS)
+    parser.add_argument("--epochs", type=int, default=None, help="Default: PTST 10, MST 70")
+    parser.add_argument("--lr", type=float, default=None, help="Default: PTST 6e-4, MST 3e-4")
+    parser.add_argument("--global_hidden_size", type=int, default=HIDDEN_SIZE)
+    parser.add_argument("--meta_hidden_size", type=int, default=META_HIDDEN_SIZE)
+    parser.add_argument("--early_stopping", action=argparse.BooleanOptionalAction, default=None,
+                        help="Default: off for PTST, on for MST; --no-early_stopping to disable")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--dropout", type=float, default=DROPOUT)
+    parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--seq_length", type=int, default=SEQ_LENGTH)
+    parser.add_argument("--lr_patience", type=int, default=LR_PATIENCE)
+    parser.add_argument("--lr_factor", type=float, default=LR_FACTOR)
+    parser.add_argument("--min_lr", type=float, default=MIN_LR)
+    parser.add_argument("--max_lr_decays", type=int, default=MAX_LR_DECAYS)
+    parser.add_argument("--grad_clip", type=float, default=GRAD_CLIP)
     parser.add_argument("--num_workers", type=int, default=0)
     args = parser.parse_args()
+    if args.epochs is None:
+        args.epochs = PTST_EPOCHS if args.init_type == "global" else MST_EPOCHS
+    if args.lr is None:
+        args.lr = PTST_LR if args.init_type == "global" else MST_LR
+    if args.early_stopping is None:
+        args.early_stopping = args.init_type == "meta"
+    apply_cli_overrides(args)
     if args.init_root is None:
         args.init_root = DEFAULT_GLOBAL_ROOT if args.init_type == "global" else DEFAULT_META_ROOT
     if args.output_root is None:
         args.output_root = DEFAULT_GLOBAL_FT_ROOT if args.init_type == "global" else DEFAULT_META_FT_ROOT
-    folds = load_splits(args.split_root)
+    folds = load_splits(args.split_root, args.folds)
     for seed in args.seeds:
         for fold in args.folds:
             gauged, _ = folds[fold]

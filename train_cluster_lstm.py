@@ -34,7 +34,7 @@ TRAIN_END = "1999-09-30"
 TEST_START = "1999-10-01"
 TEST_END = "2004-09-30"
 
-SEEDS = [12345, 1234, 123]
+SEEDS = [12345, 1234, 123,12,1]
 N_FOLDS = 5
 N_CLUSTERS = 8
 SEQ_LENGTH = 270
@@ -62,6 +62,48 @@ def normalize_basin_id(value: Any) -> str:
     if not digits:
         raise ValueError(f"Invalid basin id: {value!r}")
     return digits.zfill(8)
+
+
+
+
+def apply_cli_overrides(args: argparse.Namespace, fields: dict[str, str]) -> None:
+    """Apply explicit CLI values to the existing training constants without changing helper APIs."""
+    for arg_name, constant_name in fields.items():
+        globals()[constant_name] = getattr(args, arg_name)
+
+
+def check_positive_settings() -> None:
+    for key in ("EPOCHS", "BATCH_SIZE", "SEQ_LENGTH", "HIDDEN_SIZE"):
+        if int(globals()[key]) < 1:
+            raise ValueError(f"{key} must be positive")
+    if not (0 <= DROPOUT < 1):
+        raise ValueError("dropout must be in [0, 1)")
+    if GRAD_CLIP <= 0:
+        raise ValueError("grad_clip must be positive")
+
+
+def ensure_cache_matches(h5_path: Path, scaler_path: Path, gauged: list[str]) -> None:
+    """Do not silently reuse H5 from a different fold/sequence length."""
+    if h5_path.exists():
+        with h5py.File(h5_path, "r") as f:
+            if "input_data" not in f or "sample_2_basin" not in f:
+                raise RuntimeError(f"Unrecognized H5 schema: {h5_path}")
+            actual_seq = int(f["input_data"].shape[1])
+            if actual_seq != SEQ_LENGTH:
+                raise RuntimeError(f"{h5_path}: cached seq_length={actual_seq}, requested={SEQ_LENGTH}; use a NEW output_root")
+            cached_basins = set(np.char.decode(f["sample_2_basin"][:], "ascii").tolist())
+            if not cached_basins.issubset(set(gauged)) or not set(gauged).issubset(cached_basins):
+                raise RuntimeError(f"{h5_path}: cached basin set differs from the selected fold; use a NEW output_root")
+
+
+def protect_shared_rebuild(output_root: Path, fold: int) -> None:
+    """Rebuilding inputs underneath trained checkpoints would invalidate resume."""
+    found = []
+    for p in output_root.glob(f"seed*/fold_{fold}/**/*.pt"):
+        found.append(p)
+        break
+    if found:
+        raise RuntimeError(f"Refusing shared-data rebuild for fold_{fold}: model checkpoints exist under {output_root}. Use a NEW output_root")
 
 
 def read_basin_list(path: Path) -> list[str]:
@@ -226,11 +268,15 @@ def find_split_dir(split_root: Path, fold: int) -> Path:
     raise FileNotFoundError(f"Missing split files for fold_{fold} under {split_root}")
 
 
-def load_splits(split_root: Path) -> dict[int, tuple[list[str], list[str]]]:
+def load_splits(split_root: Path, selected_folds: list[int] | None = None) -> dict[int, tuple[list[str], list[str]]]:
+    if selected_folds is None:
+        selected_folds = list(range(1, N_FOLDS + 1))
+    if not selected_folds or len(set(selected_folds)) != len(selected_folds):
+        raise ValueError("--folds must list unique positive fold IDs")
     folds = {}
     reference_all = None
     seen_test = []
-    for fold in range(1, N_FOLDS + 1):
+    for fold in selected_folds:
         split_dir = find_split_dir(split_root, fold)
         gauged = read_basin_list(split_dir / "gauged_basins.txt")
         ungauged = read_basin_list(split_dir / "ungauged_basins.txt")
@@ -247,7 +293,7 @@ def load_splits(split_root: Path) -> dict[int, tuple[list[str], list[str]]]:
         raise RuntimeError("No folds found")
     if len(seen_test) != len(set(seen_test)):
         raise RuntimeError("A test basin appears in more than one fold")
-    if sorted(seen_test) != reference_all:
+    if selected_folds == list(range(1, N_FOLDS + 1)) and sorted(seen_test) != reference_all:
         raise RuntimeError("Five-fold test basins do not cover the full basin set exactly once")
     return folds
 
@@ -303,6 +349,7 @@ def prepare_fold_data(camels_root: Path, output_root: Path, fold: int, gauged: l
     scaler_path = data_dir / "dynamic_output_scaler.json"
     h5_path = data_dir / "train.h5"
     if force:
+        protect_shared_rebuild(output_root, fold)
         for path in [raw_db, filtered_db, scaler_path, h5_path]:
             if path.exists():
                 path.unlink()
@@ -335,6 +382,7 @@ def prepare_fold_data(camels_root: Path, output_root: Path, fold: int, gauged: l
             with_basin_str=True,
             seq_length=SEQ_LENGTH,
         )
+    ensure_cache_matches(h5_path, scaler_path, gauged)
     return filtered_db, h5_path, scaler_path, scaler
 
 
@@ -403,11 +451,15 @@ def train_one_cluster(
     h5_basin_strings: np.ndarray,
     hidden_rule: str,
     num_workers: int,
+    fixed_hidden_size: int | None = None,
 ) -> None:
     out_dir = output_root / f"seed{seed}" / f"fold_{fold}" / "cluster_models" / f"cluster_{cid}"
+    hidden_size = fixed_hidden_size if fixed_hidden_size is not None else adaptive_hidden_size(len(member_basins), hidden_rule)
+    actual_rule = "fixed" if fixed_hidden_size is not None else hidden_rule
+    validate_existing_cfg(out_dir, seed, fold, cid, hidden_size, actual_rule)
+    if not (out_dir / "run_cfg.json").exists() and any((out_dir / p).exists() for p in ("checkpoint_latest.pt", "model_best.pt", "TRAIN_DONE.json")):
+        raise RuntimeError(f"Existing checkpoints lack run_cfg.json: {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    hidden_size = adaptive_hidden_size(len(member_basins), hidden_rule)
-    validate_existing_cfg(out_dir, seed, fold, cid, hidden_size, hidden_rule)
     done_path = out_dir / "TRAIN_DONE.json"
     ckpt_path = out_dir / "checkpoint_latest.pt"
     best_path = out_dir / "model_best.pt"
@@ -496,10 +548,10 @@ def train_one_cluster(
             "seq_length": SEQ_LENGTH,
             "batch_size": BATCH_SIZE,
             "hidden_size": hidden_size,
-            "hidden_rule": hidden_rule,
+            "hidden_rule": actual_rule,
             "dropout": DROPOUT,
             "lr": LR,
-            "lr_schedule": "trainloss_plateau_rollback_pat4_factor0.8_max2",
+            "lr_schedule": f"trainloss_plateau_rollback_pat{LR_PATIENCE}_factor{LR_FACTOR:g}_max{MAX_LR_DECAYS}",
             "lr_patience": LR_PATIENCE,
             "lr_factor": LR_FACTOR,
             "min_lr": MIN_LR,
@@ -669,9 +721,29 @@ def main() -> None:
         default="monotonic_he2024",
         choices=["monotonic_he2024", "strict_he2024"],
     )
+    parser.add_argument("--folds", nargs="+", type=int, default=list(range(1, N_FOLDS + 1)))
+    parser.add_argument("--n_clusters", type=int, default=N_CLUSTERS)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--dropout", type=float, default=DROPOUT)
+    parser.add_argument("--seq_length", type=int, default=SEQ_LENGTH)
+    parser.add_argument("--lr_patience", type=int, default=LR_PATIENCE)
+    parser.add_argument("--lr_factor", type=float, default=LR_FACTOR, help="Published-code default: 0.8 (manuscript 0.7 is a typo)")
+    parser.add_argument("--min_lr", type=float, default=MIN_LR)
+    parser.add_argument("--max_lr_decays", type=int, default=MAX_LR_DECAYS)
+    parser.add_argument("--grad_clip", type=float, default=GRAD_CLIP)
+    parser.add_argument("--fixed_hidden_size", type=int, default=None, help="Override basin-count adaptive hidden-size rule")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--force_rebuild_fold_data", action="store_true")
     args = parser.parse_args()
+    apply_cli_overrides(args, {name.lower(): name for name in (
+        "N_CLUSTERS", "EPOCHS", "LR", "BATCH_SIZE", "DROPOUT", "SEQ_LENGTH", "LR_PATIENCE",
+        "LR_FACTOR", "MIN_LR", "MAX_LR_DECAYS", "GRAD_CLIP")})
+    if args.fixed_hidden_size is not None and args.fixed_hidden_size < 1:
+        raise ValueError("--fixed_hidden_size must be positive")
+    if EPOCHS < 1 or BATCH_SIZE < 1 or SEQ_LENGTH < 1 or N_CLUSTERS < 1 or LR <= 0 or LR_PATIENCE < 1 or not 0 < LR_FACTOR < 1 or MIN_LR <= 0 or MAX_LR_DECAYS < 0 or not 0 <= DROPOUT < 1 or GRAD_CLIP <= 0:
+        raise ValueError("Invalid optimization or architecture settings")
 
     camels_root = Path(args.camels_root)
     split_root = Path(args.split_root)
@@ -682,9 +754,9 @@ def main() -> None:
     if not camels_root.exists():
         raise FileNotFoundError(camels_root)
 
-    folds = load_splits(split_root)
+    folds = load_splits(split_root, args.folds)
     shared_data = {}
-    for fold in range(1, N_FOLDS + 1):
+    for fold in args.folds:
         gauged, _ = folds[fold]
         shared_data[fold] = prepare_fold_data(
             camels_root=camels_root,
@@ -700,7 +772,7 @@ def main() -> None:
     print(f"[output_root] {output_root}")
 
     for seed in args.seeds:
-        for fold in range(1, N_FOLDS + 1):
+        for fold in args.folds:
             gauged, ungauged = folds[fold]
             cluster_members = load_cluster_members(cluster_root, seed, fold, gauged)
             filtered_db, h5_path, scaler_path, scaler = shared_data[fold]
@@ -736,6 +808,7 @@ def main() -> None:
                     h5_basin_strings=h5_basin_strings,
                     hidden_rule=args.hidden_rule,
                     num_workers=args.num_workers,
+                    fixed_hidden_size=args.fixed_hidden_size,
                 )
 
     print("All cluster LSTM training runs finished.")
